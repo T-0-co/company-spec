@@ -313,6 +313,13 @@ def get_templates_dir() -> Path:
     if source_templates.exists():
         return source_templates
 
+    # Check shared-data location (wheel install via uv tool or pip)
+    # pyproject.toml installs templates to share/company-spec/templates
+    import sysconfig
+    shared_data = Path(sysconfig.get_path('data')) / 'share' / 'company-spec' / 'templates'
+    if shared_data.exists():
+        return shared_data
+
     # Check installed package location
     import importlib.resources
     try:
