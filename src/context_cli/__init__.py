@@ -450,6 +450,172 @@ def create_initial_constitution(dest_path: Path, org: str, scope: str, goal: str
     return True
 
 
+def discover_existing_context(project_path: Path) -> dict:
+    """
+    Scan the project directory for existing documentation and context.
+
+    Returns a dict with:
+    - docs_found: list of documentation files found
+    - frameworks_found: list of existing frameworks detected
+    - extracted_context: dict with any extracted project info (scope, goals, etc.)
+    - warnings: list of potential conflicts or considerations
+    """
+    result = {
+        "docs_found": [],
+        "frameworks_found": [],
+        "extracted_context": {},
+        "warnings": [],
+    }
+
+    # Patterns to look for
+    doc_patterns = [
+        "README.md", "README.txt", "README",
+        "CLAUDE.md", ".claude/CLAUDE.md",
+        "docs/project_mission.md", "docs/PROJECT_MISSION.md",
+        "docs/project_structure.md",
+        "PROJECT.md", "ABOUT.md",
+    ]
+
+    # Framework indicators
+    framework_patterns = {
+        ".context": "Company Spec (already initialized)",
+        ".specify": "Spec Kit",
+        "docs/_legacy": "Legacy framework",
+        ".claude": "Claude Code configuration",
+        "specs/": "Specs directory",
+    }
+
+    # Scan for documentation files
+    for pattern in doc_patterns:
+        path = project_path / pattern
+        if path.exists():
+            result["docs_found"].append(str(pattern))
+
+    # Also find all markdown files in docs/
+    docs_dir = project_path / "docs"
+    if docs_dir.exists():
+        for md_file in docs_dir.rglob("*.md"):
+            rel_path = md_file.relative_to(project_path)
+            if str(rel_path) not in result["docs_found"]:
+                result["docs_found"].append(str(rel_path))
+
+    # Check for existing frameworks
+    for pattern, name in framework_patterns.items():
+        path = project_path / pattern
+        if path.exists():
+            result["frameworks_found"].append((pattern, name))
+
+    # Try to extract context from key files
+    mission_file = project_path / "docs" / "project_mission.md"
+    if mission_file.exists():
+        try:
+            content = mission_file.read_text()
+            result["extracted_context"]["has_mission"] = True
+
+            # Try to extract intent/scope
+            if "## Intent" in content or "## intent" in content:
+                lines = content.split("\n")
+                for i, line in enumerate(lines):
+                    if line.strip().lower() == "## intent":
+                        # Get the next non-empty line
+                        for j in range(i + 1, min(i + 5, len(lines))):
+                            if lines[j].strip() and not lines[j].startswith("#"):
+                                result["extracted_context"]["intent"] = lines[j].strip()
+                                break
+                        break
+
+            # Check for scope constraints
+            if "Must Not" in content or "Non-Goals" in content:
+                result["extracted_context"]["has_constraints"] = True
+
+        except Exception:
+            pass
+
+    # Check CLAUDE.md for project context
+    claude_paths = [project_path / "CLAUDE.md", project_path / ".claude" / "CLAUDE.md"]
+    for claude_path in claude_paths:
+        if claude_path.exists():
+            result["extracted_context"]["has_claude_md"] = True
+            break
+
+    # Generate warnings
+    if ".context" in [f[0] for f in result["frameworks_found"]]:
+        result["warnings"].append("Company Spec already initialized - will overwrite existing .context/")
+
+    if result["extracted_context"].get("has_constraints"):
+        result["warnings"].append("Project has defined constraints/non-goals - review before defining outcomes")
+
+    if len(result["docs_found"]) > 5:
+        result["warnings"].append(f"Found {len(result['docs_found'])} existing docs - consider reviewing before capture")
+
+    return result
+
+
+def display_discovery_results(discovery: dict, console: Console) -> bool:
+    """
+    Display discovery results and ask user how to proceed.
+    Returns True if user wants to continue, False to abort.
+    """
+    if not discovery["docs_found"] and not discovery["frameworks_found"]:
+        return True  # Nothing found, proceed normally
+
+    console.print()
+    console.print("[cyan]━━━ Project Discovery ━━━[/cyan]")
+    console.print()
+
+    # Show existing documentation
+    if discovery["docs_found"]:
+        console.print(f"[yellow]Found {len(discovery['docs_found'])} existing documentation files:[/yellow]")
+        # Show first 10, summarize rest
+        for doc in discovery["docs_found"][:10]:
+            console.print(f"  • {doc}")
+        if len(discovery["docs_found"]) > 10:
+            console.print(f"  [dim]... and {len(discovery['docs_found']) - 10} more[/dim]")
+        console.print()
+
+    # Show existing frameworks
+    if discovery["frameworks_found"]:
+        console.print("[yellow]Existing frameworks detected:[/yellow]")
+        for pattern, name in discovery["frameworks_found"]:
+            console.print(f"  • {pattern} → {name}")
+        console.print()
+
+    # Show extracted context
+    if discovery["extracted_context"]:
+        console.print("[yellow]Extracted project context:[/yellow]")
+        if discovery["extracted_context"].get("intent"):
+            intent = discovery["extracted_context"]["intent"]
+            if len(intent) > 100:
+                intent = intent[:100] + "..."
+            console.print(f"  Intent: [green]{intent}[/green]")
+        if discovery["extracted_context"].get("has_constraints"):
+            console.print("  [dim]Project has defined constraints/non-goals[/dim]")
+        if discovery["extracted_context"].get("has_claude_md"):
+            console.print("  [dim]CLAUDE.md configuration present[/dim]")
+        console.print()
+
+    # Show warnings
+    if discovery["warnings"]:
+        console.print("[yellow]⚠ Considerations:[/yellow]")
+        for warning in discovery["warnings"]:
+            console.print(f"  • {warning}")
+        console.print()
+
+    # Ask user how to proceed
+    if sys.stdin.isatty():
+        console.print("[cyan]How would you like to proceed?[/cyan]")
+        options = {
+            "continue": "Continue with init (I'll review existing docs manually)",
+            "abort": "Abort (I want to review existing documentation first)",
+        }
+        choice = select_with_arrows(options, "Select action", "continue")
+        if choice == "abort":
+            console.print("\n[yellow]Aborted.[/yellow] Review existing documentation, then run init again.")
+            return False
+
+    return True
+
+
 SCOPE_OPTIONS = {
     "company": "Whole organization",
     "division": "Business division or unit",
@@ -473,10 +639,16 @@ def init(
     Initialize a new Company Context Framework engagement.
 
     This command will:
-    1. Create the .context/ directory structure
-    2. Copy all templates and scripts
-    3. Optionally create an initial constitution
-    4. Initialize a git repository
+    1. Discover existing documentation and frameworks in the directory
+    2. Present findings and ask how to proceed
+    3. Create the .context/ directory structure
+    4. Copy all templates and scripts
+    5. Create an initial constitution
+    6. Initialize a git repository (unless --no-git)
+
+    The discovery phase scans for existing docs/, README.md, CLAUDE.md,
+    and other documentation to help you understand what context already
+    exists before setting up the framework.
 
     Examples:
         companyspec init acme-marketing --org "Acme Corp" --scope team
@@ -508,6 +680,19 @@ def init(
                 console.print(f"[red]Error:[/red] Directory '{engagement_name}' already exists and is not empty")
                 console.print("[dim]Use --force to initialize anyway[/dim]")
                 raise typer.Exit(1)
+
+    # Discovery phase: scan for existing documentation and context
+    if project_path.exists():
+        discovery = discover_existing_context(project_path)
+        if not display_discovery_results(discovery, console):
+            raise typer.Exit(0)  # User chose to abort
+
+        # Use extracted context to inform defaults
+        if discovery["extracted_context"].get("intent") and not goal:
+            # Suggest the extracted intent as a starting point
+            extracted_intent = discovery["extracted_context"]["intent"]
+            if sys.stdin.isatty():
+                console.print(f"\n[dim]Extracted project intent: {extracted_intent[:80]}...[/dim]" if len(extracted_intent) > 80 else f"\n[dim]Extracted project intent: {extracted_intent}[/dim]")
 
     # Interactive prompts for missing required info
     if not org:
