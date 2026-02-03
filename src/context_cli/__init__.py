@@ -467,37 +467,82 @@ def discover_existing_context(project_path: Path) -> dict:
         "warnings": [],
     }
 
-    # Patterns to look for
-    doc_patterns = [
-        "README.md", "README.txt", "README",
-        "CLAUDE.md", ".claude/CLAUDE.md",
-        "docs/project_mission.md", "docs/PROJECT_MISSION.md",
-        "docs/project_structure.md",
-        "PROJECT.md", "ABOUT.md",
-    ]
-
     # Framework indicators
     framework_patterns = {
         ".context": "Company Spec (already initialized)",
         ".specify": "Spec Kit",
-        "docs/_legacy": "Legacy framework",
         ".claude": "Claude Code configuration",
         "specs/": "Specs directory",
     }
 
-    # Scan for documentation files
-    for pattern in doc_patterns:
-        path = project_path / pattern
-        if path.exists():
-            result["docs_found"].append(str(pattern))
+    # Common documentation locations to check
+    doc_locations = [
+        project_path,
+        project_path / "docs",
+        project_path / ".claude",
+        project_path / ".github",
+    ]
 
-    # Also find all markdown files in docs/
-    docs_dir = project_path / "docs"
-    if docs_dir.exists():
-        for md_file in docs_dir.rglob("*.md"):
-            rel_path = md_file.relative_to(project_path)
-            if str(rel_path) not in result["docs_found"]:
-                result["docs_found"].append(str(rel_path))
+    # Patterns that indicate project documentation (case-insensitive matching)
+    project_doc_patterns = [
+        "readme", "claude", "project", "mission", "about", "overview",
+        "contributing", "architecture", "structure", "goals",
+    ]
+
+    # Package/config files that may contain project info
+    package_files = [
+        "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
+        "composer.json", "Gemfile", "pom.xml", "build.gradle",
+    ]
+
+    # Scan for documentation files
+    seen_paths = set()
+
+    for location in doc_locations:
+        if not location.exists():
+            continue
+
+        # Find markdown and text files
+        for ext in ["*.md", "*.txt", "*.rst"]:
+            for doc_file in location.glob(ext):
+                rel_path = doc_file.relative_to(project_path)
+                if str(rel_path) not in seen_paths:
+                    seen_paths.add(str(rel_path))
+                    result["docs_found"].append(str(rel_path))
+
+        # Also check subdirectories for docs/ folder
+        if location == project_path:
+            docs_dir = location / "docs"
+            if docs_dir.exists():
+                for md_file in docs_dir.rglob("*.md"):
+                    rel_path = md_file.relative_to(project_path)
+                    if str(rel_path) not in seen_paths:
+                        seen_paths.add(str(rel_path))
+                        result["docs_found"].append(str(rel_path))
+
+    # Check for package files
+    for pkg_file in package_files:
+        pkg_path = project_path / pkg_file
+        if pkg_path.exists():
+            result["docs_found"].append(pkg_file)
+            # Try to extract project name/description from package files
+            try:
+                content = pkg_path.read_text()
+                if pkg_file == "package.json":
+                    import json
+                    data = json.loads(content)
+                    if "description" in data:
+                        result["extracted_context"]["project_description"] = data["description"]
+                elif pkg_file == "pyproject.toml":
+                    # Simple extraction without toml library
+                    for line in content.split("\n"):
+                        if line.strip().startswith("description"):
+                            desc = line.split("=", 1)[-1].strip().strip('"\'')
+                            if desc:
+                                result["extracted_context"]["project_description"] = desc
+                            break
+            except Exception:
+                pass
 
     # Check for existing frameworks
     for pattern, name in framework_patterns.items():
@@ -505,28 +550,84 @@ def discover_existing_context(project_path: Path) -> dict:
         if path.exists():
             result["frameworks_found"].append((pattern, name))
 
-    # Try to extract context from key files
-    mission_file = project_path / "docs" / "project_mission.md"
-    if mission_file.exists():
+    # Check for legacy/archived documentation
+    for legacy_pattern in ["_legacy", "legacy", "archived", "old"]:
+        for location in [project_path, project_path / "docs"]:
+            legacy_path = location / legacy_pattern
+            if legacy_path.exists() and legacy_path.is_dir():
+                result["frameworks_found"].append((str(legacy_path.relative_to(project_path)), "Legacy/archived docs"))
+                break
+
+    # Try to extract context from files that look like project documentation
+    # Sort docs to prioritize likely project info files
+    def doc_priority(doc_path: str) -> int:
+        """Lower number = higher priority for project info extraction."""
+        lower_path = doc_path.lower()
+        if "mission" in lower_path:
+            return 0
+        if "readme" in lower_path and "docs" not in lower_path:
+            return 1
+        if "claude" in lower_path:
+            return 2
+        if "overview" in lower_path or "about" in lower_path:
+            return 3
+        if "project" in lower_path:
+            return 4
+        return 100
+
+    sorted_docs = sorted(result["docs_found"], key=doc_priority)
+
+    # Headers that typically contain project intent/purpose
+    intent_headers = [
+        "## intent", "## purpose", "## overview", "## about", "## summary",
+        "## description", "## what is", "## goal", "## goals", "## objective",
+        "# intent", "# purpose", "# overview", "# about",
+    ]
+
+    # Headers that indicate constraints/scope
+    constraint_headers = [
+        "## must not", "## non-goals", "## non goals", "## out of scope",
+        "## constraints", "## limitations", "## boundaries", "### must not",
+    ]
+
+    # Extract context from high-priority docs
+    for doc_path in sorted_docs[:5]:  # Check top 5 priority docs
+        full_path = project_path / doc_path
+        if not full_path.exists() or not full_path.is_file():
+            continue
+
         try:
-            content = mission_file.read_text()
-            result["extracted_context"]["has_mission"] = True
+            content = full_path.read_text(errors="ignore")
+            lower_content = content.lower()
 
-            # Try to extract intent/scope
-            if "## Intent" in content or "## intent" in content:
-                lines = content.split("\n")
-                for i, line in enumerate(lines):
-                    if line.strip().lower() == "## intent":
-                        # Get the next non-empty line
-                        for j in range(i + 1, min(i + 5, len(lines))):
-                            if lines[j].strip() and not lines[j].startswith("#"):
-                                result["extracted_context"]["intent"] = lines[j].strip()
+            # Track which file we extracted from
+            source_file = doc_path
+
+            # Look for intent/purpose
+            if "intent" not in result["extracted_context"]:
+                for header in intent_headers:
+                    if header in lower_content:
+                        lines = content.split("\n")
+                        for i, line in enumerate(lines):
+                            if line.strip().lower() == header.strip():
+                                # Get the next non-empty, non-header line
+                                for j in range(i + 1, min(i + 5, len(lines))):
+                                    next_line = lines[j].strip()
+                                    if next_line and not next_line.startswith("#"):
+                                        result["extracted_context"]["intent"] = next_line
+                                        result["extracted_context"]["intent_source"] = source_file
+                                        break
                                 break
-                        break
+                        if "intent" in result["extracted_context"]:
+                            break
 
-            # Check for scope constraints
-            if "Must Not" in content or "Non-Goals" in content:
-                result["extracted_context"]["has_constraints"] = True
+            # Look for constraints/non-goals
+            if "has_constraints" not in result["extracted_context"]:
+                for header in constraint_headers:
+                    if header in lower_content:
+                        result["extracted_context"]["has_constraints"] = True
+                        result["extracted_context"]["constraints_source"] = source_file
+                        break
 
         except Exception:
             pass
@@ -583,13 +684,22 @@ def display_discovery_results(discovery: dict, console: Console) -> bool:
     # Show extracted context
     if discovery["extracted_context"]:
         console.print("[yellow]Extracted project context:[/yellow]")
+        if discovery["extracted_context"].get("project_description"):
+            desc = discovery["extracted_context"]["project_description"]
+            if len(desc) > 100:
+                desc = desc[:100] + "..."
+            console.print(f"  Description: [green]{desc}[/green]")
         if discovery["extracted_context"].get("intent"):
             intent = discovery["extracted_context"]["intent"]
+            source = discovery["extracted_context"].get("intent_source", "")
             if len(intent) > 100:
                 intent = intent[:100] + "..."
-            console.print(f"  Intent: [green]{intent}[/green]")
+            source_hint = f" [dim](from {source})[/dim]" if source else ""
+            console.print(f"  Intent: [green]{intent}[/green]{source_hint}")
         if discovery["extracted_context"].get("has_constraints"):
-            console.print("  [dim]Project has defined constraints/non-goals[/dim]")
+            source = discovery["extracted_context"].get("constraints_source", "")
+            source_hint = f" [dim](from {source})[/dim]" if source else ""
+            console.print(f"  [dim]Project has defined constraints/non-goals[/dim]{source_hint}")
         if discovery["extracted_context"].get("has_claude_md"):
             console.print("  [dim]CLAUDE.md configuration present[/dim]")
         console.print()
