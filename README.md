@@ -11,6 +11,8 @@
     <em>Built on <a href="https://github.com/github/spec-kit">GitHub's Spec Kit</a> methodology, adapted for knowledge capture instead of software development.</em>
 </p>
 
+> **Notion**: Tracked in [T-0 Resources](https://www.notion.so/302c0fdf942d815ea8d6f3f6f5923055)
+
 ---
 
 ## Table of Contents
